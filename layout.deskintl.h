@@ -225,11 +225,12 @@ static struct key keys_full[] = {
   {"⇧", "⇫", 1.0, Mod, Shift, .scheme = 1},
   {"", "", 0.0, EndRow},
 
+  {"⌨↓", "⌨↓", 1.0, Code, KEY_F24, .scheme = 1},
   {"⌨͕", "⌨͔", 1.5, NextLayer, .scheme = 1},
   {"Ctr", "Ctr", 1.0, Mod, Ctrl, .scheme = 1},
   {"Sup", "Sup", 1.0, Mod, Super, .scheme = 1},
   {"Alt", "Alt", 1.0, Mod, Alt, .scheme = 1},
-  {"", "", 5.0, Code, KEY_SPACE},
+  {"", "", 4.0, Code, KEY_SPACE},
   {"AGr", "AGr", 1.0, Mod, AltGr, .scheme = 1},
   {"Ctr", "Ctr", 1.0, Mod, Ctrl, .scheme = 1},
   {"←", "←", 1.0, Code, KEY_LEFT, .scheme = 1},
