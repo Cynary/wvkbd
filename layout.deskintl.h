@@ -5,6 +5,9 @@
 /* how tall the keyboard should be by default (can be overriden) */
 #define KBD_PIXEL_LANDSCAPE_HEIGHT 400
 
+/* suggestions bar height above keys (pixels) */
+#define KBD_SUGGEST_HEIGHT 48
+
 /* spacing around each key */
 #define KBD_KEY_BORDER 2
 

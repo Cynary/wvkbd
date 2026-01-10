@@ -54,6 +54,14 @@ void drw_draw_text(struct drwsurf *ds, Color color, uint32_t x, uint32_t y,
                    uint32_t w, uint32_t h, uint32_t b, const char *label,
                    PangoFontDescription *font_description);
 
+void drw_over_polyline(struct drwsurf *ds, Color color, double width_px,
+                       const double *xs, const double *ys,
+                       const uint8_t *alphas, size_t n);
+
+void drw_measure_text(struct drwsurf *ds, const char *label,
+                      PangoFontDescription *font_description, int *out_w,
+                      int *out_h);
+
 uint32_t setup_buffer(struct drwsurf *ds, struct drwbuf *db);
 
 #endif

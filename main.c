@@ -10,6 +10,8 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/signalfd.h>
+#include <sys/timerfd.h>
+#include <time.h>
 #include <poll.h>
 #include <unistd.h>
 #include <wayland-client-protocol.h>
@@ -79,6 +81,46 @@ static struct kbd keyboard;
 static uint32_t height, normal_height, landscape_height;
 static int rounding = DEFAULT_ROUNDING;
 static bool hidden = false;
+
+static struct wvkbd_predictor predictor;
+static bool predictor_initialized;
+static bool trail_timer_armed;
+
+static uint64_t
+mono_now_ms(void)
+{
+    struct timespec ts = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return ((uint64_t)ts.tv_sec * 1000ULL) + ((uint64_t)ts.tv_nsec / 1000000ULL);
+}
+
+static void
+update_trail_clock(uint32_t time_ms)
+{
+    keyboard.trail_last_input_ms = time_ms;
+    keyboard.trail_last_mono_ms = mono_now_ms();
+    keyboard.trail_now_ms = time_ms;
+}
+
+static char *
+join_path2(const char *base, const char *suffix)
+{
+    if (!base || !base[0] || !suffix) {
+        return NULL;
+    }
+    size_t base_len = strlen(base);
+    size_t suffix_len = strlen(suffix);
+    char *out = malloc(base_len + suffix_len + 1);
+    if (!out) {
+        return NULL;
+    }
+    memcpy(out, base, base_len);
+    memcpy(out + base_len, suffix, suffix_len);
+    out[base_len + suffix_len] = '\0';
+    return out;
+}
 
 /* event handler prototypes */
 static void wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
@@ -198,22 +240,25 @@ wl_touch_down(void *data, struct wl_touch *wl_touch, uint32_t serial,
         return;
     }
 
-    struct key *next_key;
-    uint32_t touch_x, touch_y;
+    uint32_t touch_x = wl_fixed_to_int(x);
+    uint32_t touch_y = wl_fixed_to_int(y);
 
-    touch_x = wl_fixed_to_int(x);
-    touch_y = wl_fixed_to_int(y);
-
-    kbd_unpress_key(&keyboard, time);
-
-    next_key = kbd_get_key(&keyboard, touch_x, touch_y);
-    if (next_key) {
-        kbd_press_key(&keyboard, next_key, time);
-    } else if (keyboard.compose) {
-        keyboard.compose = 0;
-        kbd_switch_layout(&keyboard, keyboard.prevlayout,
-                          keyboard.last_abc_index);
+    if (keyboard.print_intersect) {
+        struct key *next_key;
+        kbd_unpress_key(&keyboard, time);
+        next_key = kbd_get_key(&keyboard, touch_x, touch_y);
+        if (next_key) {
+            kbd_press_key(&keyboard, next_key, time);
+        } else if (keyboard.compose) {
+            keyboard.compose = 0;
+            kbd_switch_layout(&keyboard, keyboard.prevlayout,
+                              keyboard.last_abc_index);
+        }
+        return;
     }
+
+    update_trail_clock(time);
+    kbd_input_down(&keyboard, time, touch_x, touch_y);
 }
 
 void
@@ -224,7 +269,15 @@ wl_touch_up(void *data, struct wl_touch *wl_touch, uint32_t serial,
         return;
     }
 
-    kbd_release_key(&keyboard, time);
+    if (keyboard.print_intersect) {
+        kbd_release_key(&keyboard, time);
+        return;
+    }
+
+    update_trail_clock(time);
+    uint32_t last_x = (uint32_t)(keyboard.input_last_x < 0 ? 0 : keyboard.input_last_x);
+    uint32_t last_y = (uint32_t)(keyboard.input_last_y < 0 ? 0 : keyboard.input_last_y);
+    kbd_input_up(&keyboard, time, last_x, last_y);
 }
 
 void
@@ -235,12 +288,16 @@ wl_touch_motion(void *data, struct wl_touch *wl_touch, uint32_t time,
         return;
     }
 
-    uint32_t touch_x, touch_y;
+    uint32_t touch_x = wl_fixed_to_int(x);
+    uint32_t touch_y = wl_fixed_to_int(y);
 
-    touch_x = wl_fixed_to_int(x);
-    touch_y = wl_fixed_to_int(y);
+    if (keyboard.print_intersect) {
+        kbd_motion_key(&keyboard, time, touch_x, touch_y);
+        return;
+    }
 
-    kbd_motion_key(&keyboard, time, touch_x, touch_y);
+    update_trail_clock(time);
+    kbd_input_motion(&keyboard, time, touch_x, touch_y);
 }
 
 void
@@ -277,6 +334,13 @@ wl_pointer_leave(void *data, struct wl_pointer *wl_pointer, uint32_t serial,
                  struct wl_surface *surface)
 {
     cur_x = cur_y = -1;
+    if (cur_press && !keyboard.print_intersect) {
+        cur_press = false;
+        keyboard.input_down = false;
+        keyboard.input_mode = KBD_INPUT_NONE;
+        keyboard.preview_key = NULL;
+        kbd_draw_layout(&keyboard);
+    }
 }
 
 void
@@ -291,7 +355,12 @@ wl_pointer_motion(void *data, struct wl_pointer *wl_pointer, uint32_t time,
     cur_y = wl_fixed_to_int(surface_y);
 
     if (cur_press) {
-        kbd_motion_key(&keyboard, time, cur_x, cur_y);
+        if (keyboard.print_intersect) {
+            kbd_motion_key(&keyboard, time, cur_x, cur_y);
+        } else {
+            update_trail_clock(time);
+            kbd_input_motion(&keyboard, time, (uint32_t)cur_x, (uint32_t)cur_y);
+        }
     }
 }
 
@@ -303,24 +372,36 @@ wl_pointer_button(void *data, struct wl_pointer *wl_pointer, uint32_t serial,
         return;
     }
 
-    struct key *next_key;
     cur_press = state == WL_POINTER_BUTTON_STATE_PRESSED;
 
-    if (cur_press) {
-        kbd_unpress_key(&keyboard, time);
-    } else {
-        kbd_release_key(&keyboard, time);
+    if (keyboard.print_intersect) {
+        struct key *next_key;
+        if (cur_press) {
+            kbd_unpress_key(&keyboard, time);
+        } else {
+            kbd_release_key(&keyboard, time);
+        }
+        if (cur_press && cur_x >= 0 && cur_y >= 0) {
+            next_key = kbd_get_key(&keyboard, cur_x, cur_y);
+            if (next_key) {
+                kbd_press_key(&keyboard, next_key, time);
+            } else if (keyboard.compose) {
+                keyboard.compose = 0;
+                kbd_switch_layout(&keyboard, keyboard.prevlayout,
+                                  keyboard.last_abc_index);
+            }
+        }
+        return;
     }
 
     if (cur_press && cur_x >= 0 && cur_y >= 0) {
-        next_key = kbd_get_key(&keyboard, cur_x, cur_y);
-        if (next_key) {
-            kbd_press_key(&keyboard, next_key, time);
-        } else if (keyboard.compose) {
-            keyboard.compose = 0;
-            kbd_switch_layout(&keyboard, keyboard.prevlayout,
-                              keyboard.last_abc_index);
-        }
+        update_trail_clock(time);
+        kbd_input_down(&keyboard, time, (uint32_t)cur_x, (uint32_t)cur_y);
+    } else if (!cur_press) {
+        update_trail_clock(time);
+        uint32_t last_x = (uint32_t)(keyboard.input_last_x < 0 ? 0 : keyboard.input_last_x);
+        uint32_t last_y = (uint32_t)(keyboard.input_last_y < 0 ? 0 : keyboard.input_last_y);
+        kbd_input_up(&keyboard, time, last_x, last_y);
     }
 }
 
@@ -694,6 +775,16 @@ usage(char *argv0)
     fprintf(stderr, "  -H [int]    - Height in pixels\n");
     fprintf(stderr, "  -L [int]    - Landscape height in pixels\n");
     fprintf(stderr, "  -R [int]    - Rounding radius in pixels\n");
+    fprintf(stderr, "  --suggest-height [int] - Suggestion bar height in pixels\n");
+    fprintf(stderr, "  --suggestions [int]    - Number of suggestions to show\n");
+    fprintf(stderr, "  --context-words [int]  - Context words to remember\n");
+    fprintf(stderr, "  --wordlist [path]      - Base wordlist path\n");
+    fprintf(stderr, "  --user-words [path]    - User dictionary path\n");
+    fprintf(stderr, "  --bigrams [path]       - Bigram counts file path\n");
+    fprintf(stderr, "  --trail [0|1]          - Enable swipe trail\n");
+    fprintf(stderr, "  --trail-fade-ms [int]  - Swipe trail time fade (ms, 0=off)\n");
+    fprintf(stderr, "  --trail-fade-distance [float] - Swipe trail distance fade (px, 0=off)\n");
+    fprintf(stderr, "  --trail-width [float]  - Swipe trail width (px)\n");
     fprintf(stderr, "  --fn [font] - Set font (e.g: DejaVu Sans 20)\n");
     fprintf(stderr, "  --hidden    - Start hidden (send SIGUSR2 to show)\n");
     fprintf(
@@ -836,14 +927,48 @@ main(int argc, char **argv)
     /* parse command line arguments */
     char *layer_names_list = NULL, *landscape_layer_names_list = NULL;
     char *fc_font_pattern = NULL;
-    height = landscape_height = KBD_PIXEL_LANDSCAPE_HEIGHT;
-    normal_height = KBD_PIXEL_HEIGHT;
+
+    uint32_t suggest_height = KBD_SUGGEST_HEIGHT;
+    int suggest_count = 3;
+    int context_words = 5;
+
+    bool trail_enabled = true;
+    uint32_t trail_fade_ms = 800;
+    double trail_fade_distance = 0.0;
+    double trail_width = 10.0;
+
+    const char *wordlist_path = NULL;
+    const char *user_words_path = NULL;
+    const char *bigrams_path = NULL;
 
     char *tmp;
     if ((tmp = getenv("WVKBD_LAYERS")))
         layer_names_list = estrdup(tmp);
     if ((tmp = getenv("WVKBD_LANDSCAPE_LAYERS")))
         landscape_layer_names_list = estrdup(tmp);
+    if ((tmp = getenv("WVKBD_SUGGEST_HEIGHT")))
+        suggest_height = (uint32_t)atoi(tmp);
+    if ((tmp = getenv("WVKBD_SUGGESTIONS")))
+        suggest_count = atoi(tmp);
+    if ((tmp = getenv("WVKBD_CONTEXT_WORDS")))
+        context_words = atoi(tmp);
+    if ((tmp = getenv("WVKBD_TRAIL_ENABLE")))
+        trail_enabled = atoi(tmp) != 0;
+    if ((tmp = getenv("WVKBD_TRAIL_FADE_MS")))
+        trail_fade_ms = (uint32_t)atoi(tmp);
+    if ((tmp = getenv("WVKBD_TRAIL_FADE_DISTANCE_PX")))
+        trail_fade_distance = atof(tmp);
+    if ((tmp = getenv("WVKBD_TRAIL_WIDTH_PX")))
+        trail_width = atof(tmp);
+    if ((tmp = getenv("WVKBD_WORDLIST_PATH")))
+        wordlist_path = tmp;
+    if ((tmp = getenv("WVKBD_USER_WORDS_PATH")))
+        user_words_path = tmp;
+    if ((tmp = getenv("WVKBD_BIGRAMS_PATH")))
+        bigrams_path = tmp;
+
+    height = landscape_height = KBD_PIXEL_LANDSCAPE_HEIGHT + suggest_height;
+    normal_height = KBD_PIXEL_HEIGHT + suggest_height;
     if ((tmp = getenv("WVKBD_HEIGHT")))
         normal_height = atoi(tmp);
     if ((tmp = getenv("WVKBD_LANDSCAPE_HEIGHT")))
@@ -858,6 +983,9 @@ main(int argc, char **argv)
     keyboard.preferred_scale = 1;
     keyboard.preferred_fractional_scale = 0;
     keyboard.exclusive = true;
+    keyboard.suggest_height = suggest_height;
+    keyboard.suggest_visible_count = suggest_count;
+    keyboard.context_words_max = context_words;
 
     uint8_t alpha = 0;
     bool alpha_defined = false;
@@ -870,6 +998,69 @@ main(int argc, char **argv)
         } else if ((!strcmp(argv[i], "-h")) || (!strcmp(argv[i], "--help"))) {
             usage(argv[0]);
             exit(0);
+        } else if (!strcmp(argv[i], "--suggest-height")) {
+            if (i >= argc - 1) {
+                usage(argv[0]);
+                exit(1);
+            }
+            suggest_height = (uint32_t)atoi(argv[++i]);
+            keyboard.suggest_height = suggest_height;
+        } else if (!strcmp(argv[i], "--suggestions")) {
+            if (i >= argc - 1) {
+                usage(argv[0]);
+                exit(1);
+            }
+            suggest_count = atoi(argv[++i]);
+            keyboard.suggest_visible_count = suggest_count;
+        } else if (!strcmp(argv[i], "--context-words")) {
+            if (i >= argc - 1) {
+                usage(argv[0]);
+                exit(1);
+            }
+            context_words = atoi(argv[++i]);
+            keyboard.context_words_max = context_words;
+        } else if (!strcmp(argv[i], "--wordlist")) {
+            if (i >= argc - 1) {
+                usage(argv[0]);
+                exit(1);
+            }
+            wordlist_path = argv[++i];
+        } else if (!strcmp(argv[i], "--user-words")) {
+            if (i >= argc - 1) {
+                usage(argv[0]);
+                exit(1);
+            }
+            user_words_path = argv[++i];
+        } else if (!strcmp(argv[i], "--bigrams")) {
+            if (i >= argc - 1) {
+                usage(argv[0]);
+                exit(1);
+            }
+            bigrams_path = argv[++i];
+        } else if (!strcmp(argv[i], "--trail")) {
+            if (i >= argc - 1) {
+                usage(argv[0]);
+                exit(1);
+            }
+            trail_enabled = atoi(argv[++i]) != 0;
+        } else if (!strcmp(argv[i], "--trail-fade-ms")) {
+            if (i >= argc - 1) {
+                usage(argv[0]);
+                exit(1);
+            }
+            trail_fade_ms = (uint32_t)atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--trail-fade-distance")) {
+            if (i >= argc - 1) {
+                usage(argv[0]);
+                exit(1);
+            }
+            trail_fade_distance = atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--trail-width")) {
+            if (i >= argc - 1) {
+                usage(argv[0]);
+                exit(1);
+            }
+            trail_width = atof(argv[++i]);
         } else if (!strcmp(argv[i], "-l")) {
             if (i >= argc - 1) {
                 usage(argv[0]);
@@ -1021,6 +1212,50 @@ main(int argc, char **argv)
             schemes[i].rounding = rounding;
     }
 
+    if (keyboard.suggest_visible_count <= 0) {
+        keyboard.suggest_visible_count = 3;
+    }
+    if (keyboard.context_words_max <= 0) {
+        keyboard.context_words_max = 5;
+    }
+    if (keyboard.context_words_max > WVKBD_MAX_CONTEXT_WORDS) {
+        keyboard.context_words_max = WVKBD_MAX_CONTEXT_WORDS;
+    }
+
+    if (!predictor_initialized) {
+        predictor_initialized = wvkbd_predictor_init(&predictor);
+        if (!predictor_initialized) {
+            fprintf(stderr, "wvkbd: predictor init failed\n");
+        }
+    }
+
+    const char *xdg_data_home = getenv("XDG_DATA_HOME");
+    const char *home = getenv("HOME");
+    char xdg_buf[4096];
+    if ((!xdg_data_home || !xdg_data_home[0]) && home && home[0]) {
+        snprintf(xdg_buf, sizeof(xdg_buf), "%s/.local/share", home);
+        xdg_data_home = xdg_buf;
+    }
+
+    if (!wordlist_path && xdg_data_home) {
+        wordlist_path = join_path2(xdg_data_home, "/wvkbd/words.txt");
+    }
+    if (!user_words_path && xdg_data_home) {
+        user_words_path = join_path2(xdg_data_home, "/wvkbd/user_words.txt");
+    }
+    if (!bigrams_path && xdg_data_home) {
+        bigrams_path = join_path2(xdg_data_home, "/wvkbd/bigrams.txt");
+    }
+
+    if (predictor_initialized) {
+        wvkbd_predictor_set_paths(&predictor, wordlist_path, user_words_path,
+                                  bigrams_path);
+        if (!wvkbd_predictor_reload(&predictor)) {
+            fprintf(stderr, "wvkbd: predictor reload failed\n");
+        }
+        kbd_set_predictor(&keyboard, &predictor);
+    }
+
     display = wl_display_connect(NULL);
     if (display == NULL) {
         die("Failed to create display\n");
@@ -1075,6 +1310,11 @@ main(int argc, char **argv)
     kbd_init(&keyboard, (struct layout *)&layouts, layer_names_list,
              landscape_layer_names_list);
 
+    keyboard.trail_enabled = trail_enabled;
+    keyboard.trail_fade_ms = trail_fade_ms;
+    keyboard.trail_fade_distance_px = trail_fade_distance;
+    keyboard.trail_width_px = trail_width;
+
     for (i = 0; i < countof(schemes); i++) {
         schemes[i].font_description =
             pango_font_description_from_string(schemes[i].font);
@@ -1083,11 +1323,13 @@ main(int argc, char **argv)
     if (!hidden)
         show();
 
-    struct pollfd fds[2];
+    struct pollfd fds[3];
     int WAYLAND_FD = 0;
     int SIGNAL_FD = 1;
+    int TIMER_FD = 2;
     fds[WAYLAND_FD].events = POLLIN;
     fds[SIGNAL_FD].events = POLLIN;
+    fds[TIMER_FD].events = POLLIN;
 
     fds[WAYLAND_FD].fd = wl_display_get_fd(display);
     if (fds[WAYLAND_FD].fd == -1) {
@@ -1109,9 +1351,29 @@ main(int argc, char **argv)
         die("Failed to get signalfd: %d\n", errno);
     }
 
+    fds[TIMER_FD].fd =
+        timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+    if (fds[TIMER_FD].fd == -1) {
+        die("Failed to create timerfd: %d\n", errno);
+    }
+
     while (run_display) {
         wl_display_flush(display);
-        poll(fds, 2, -1);
+
+        bool want_timer = keyboard.trail_enabled && keyboard.swipe_points_len >= 2;
+        if (want_timer && !trail_timer_armed) {
+            struct itimerspec its = {0};
+            its.it_interval.tv_nsec = 16 * 1000 * 1000;
+            its.it_value = its.it_interval;
+            timerfd_settime(fds[TIMER_FD].fd, 0, &its, NULL);
+            trail_timer_armed = true;
+        } else if (!want_timer && trail_timer_armed) {
+            struct itimerspec its = {0};
+            timerfd_settime(fds[TIMER_FD].fd, 0, &its, NULL);
+            trail_timer_armed = false;
+        }
+
+        poll(fds, 3, -1);
 
         if (fds[WAYLAND_FD].revents & POLLIN)
             wl_display_dispatch(display);
@@ -1135,6 +1397,19 @@ main(int argc, char **argv)
                 toggle_visibility();
             else if (si.ssi_signo == SIGPIPE)
                 pipewarn();
+        }
+
+        if (fds[TIMER_FD].revents & POLLIN) {
+            uint64_t expirations = 0;
+            (void)read(fds[TIMER_FD].fd, &expirations, sizeof(expirations));
+
+            if (keyboard.trail_last_mono_ms && keyboard.trail_last_input_ms) {
+                uint64_t now_mono = mono_now_ms();
+                uint64_t delta = now_mono - keyboard.trail_last_mono_ms;
+                keyboard.trail_now_ms =
+                    keyboard.trail_last_input_ms + (uint32_t)delta;
+            }
+            kbd_draw_layout(&keyboard);
         }
     }
 

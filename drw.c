@@ -5,6 +5,7 @@
 #include "drw.h"
 #include "shm_open.h"
 #include "math.h"
+#include <stddef.h>
 
 void drwbuf_handle_release(void *data, struct wl_buffer *wl_buffer) {
     struct drwsurf *ds = data;
@@ -153,6 +154,85 @@ drw_draw_text(struct drwsurf *ds, Color color, uint32_t x, uint32_t y,
 
     pango_cairo_show_layout(d->cairo, d->layout);
     cairo_restore(d->cairo);
+}
+
+void
+drw_over_polyline(struct drwsurf *ds, Color color, double width_px,
+                  const double *xs, const double *ys, const uint8_t *alphas,
+                  size_t n)
+{
+    if (!xs || !ys || n < 2) {
+        return;
+    }
+
+    double min_x = xs[0], max_x = xs[0], min_y = ys[0], max_y = ys[0];
+    for (size_t i = 1; i < n; i++) {
+        if (xs[i] < min_x)
+            min_x = xs[i];
+        if (xs[i] > max_x)
+            max_x = xs[i];
+        if (ys[i] < min_y)
+            min_y = ys[i];
+        if (ys[i] > max_y)
+            max_y = ys[i];
+    }
+
+    double pad = width_px + 4.0;
+    uint32_t damage_x = (uint32_t)fmax(0.0, floor(min_x - pad));
+    uint32_t damage_y = (uint32_t)fmax(0.0, floor(min_y - pad));
+    uint32_t damage_w = (uint32_t)ceil((max_x - min_x) + (pad * 2));
+    uint32_t damage_h = (uint32_t)ceil((max_y - min_y) + (pad * 2));
+
+    drwsurf_flip(ds);
+    struct drwbuf *d = ds->back_buffer;
+    drwsurf_damage(ds, damage_x, damage_y, damage_w, damage_h);
+
+    cairo_save(d->cairo);
+    cairo_set_operator(d->cairo, CAIRO_OPERATOR_OVER);
+    cairo_set_antialias(d->cairo, CAIRO_ANTIALIAS_DEFAULT);
+    cairo_set_line_width(d->cairo, width_px);
+    cairo_set_line_cap(d->cairo, CAIRO_LINE_CAP_ROUND);
+    cairo_set_line_join(d->cairo, CAIRO_LINE_JOIN_ROUND);
+
+    for (size_t i = 1; i < n; i++) {
+        double alpha = color.bgra[3] / (double)255;
+        if (alphas) {
+            alpha *= alphas[i] / (double)255;
+        }
+        cairo_set_source_rgba(d->cairo, color.bgra[2] / (double)255,
+                              color.bgra[1] / (double)255,
+                              color.bgra[0] / (double)255, alpha);
+        cairo_move_to(d->cairo, xs[i - 1], ys[i - 1]);
+        cairo_line_to(d->cairo, xs[i], ys[i]);
+        cairo_stroke(d->cairo);
+    }
+
+    cairo_restore(d->cairo);
+}
+
+void
+drw_measure_text(struct drwsurf *ds, const char *label,
+                 PangoFontDescription *font_description, int *out_w,
+                 int *out_h)
+{
+    if (!ds || !label || !ds->back_buffer || !ds->back_buffer->layout) {
+        if (out_w)
+            *out_w = 0;
+        if (out_h)
+            *out_h = 0;
+        return;
+    }
+
+    struct drwbuf *d = ds->back_buffer;
+    pango_layout_set_font_description(d->layout, font_description);
+    pango_layout_set_text(d->layout, label, -1);
+
+    int w = 0, h = 0;
+    pango_layout_get_pixel_size(d->layout, &w, &h);
+    if (out_w)
+        *out_w = w;
+    if (out_h)
+        *out_h = h;
 }
 
 void
