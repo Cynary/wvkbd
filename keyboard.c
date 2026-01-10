@@ -640,6 +640,10 @@ kbd_suggestion_word(const struct wvkbd_suggestion *s)
 }
 
 static void
+kbd_adjust_suggestion_case(struct kbd *kb, const char *word, uint8_t mods,
+                           char out[WVKBD_MAX_TOKEN_BYTES]);
+
+static void
 kbd_draw_suggestions(struct kbd *kb)
 {
     if (!kb->suggest_height) {
@@ -704,11 +708,18 @@ kbd_draw_suggestions(struct kbd *kb)
 
     int pills = 0;
     double pills_w = 0.0;
+    char disp[WVKBD_MAX_TOKEN_BYTES];
     for (int i = 0; i < kb->suggestions_len; i++) {
         const struct wvkbd_suggestion *s = &kb->suggestions[i];
         const char *word = kbd_suggestion_word(s);
         if (!word || !word[0]) {
             continue;
+        }
+        if (s->kind == WVKBD_SUGGEST_WORD) {
+            kbd_adjust_suggestion_case(kb, word, kb->mods, disp);
+            if (disp[0]) {
+                word = disp;
+            }
         }
 
         int text_w = 0, text_h = 0;
@@ -757,6 +768,12 @@ kbd_draw_suggestions(struct kbd *kb)
         const char *word = kbd_suggestion_word(s);
         if (!word || !word[0]) {
             continue;
+        }
+        if (s->kind == WVKBD_SUGGEST_WORD) {
+            kbd_adjust_suggestion_case(kb, word, kb->mods, disp);
+            if (disp[0]) {
+                word = disp;
+            }
         }
 
         uint32_t pill_w = widths[i];
@@ -1444,6 +1461,64 @@ kbd_type_text_utf8(struct kbd *kb, uint32_t time_ms, const char *text)
 }
 
 static void
+kbd_adjust_suggestion_case(struct kbd *kb, const char *word, uint8_t mods,
+                           char out[WVKBD_MAX_TOKEN_BYTES])
+{
+    if (!out) {
+        return;
+    }
+    out[0] = '\0';
+    if (!kb || !word || !word[0]) {
+        return;
+    }
+
+    strncpy(out, word, WVKBD_MAX_TOKEN_BYTES - 1);
+    out[WVKBD_MAX_TOKEN_BYTES - 1] = '\0';
+    ascii_lower_inplace(out);
+
+    // Preserve simple capitalization intent from the already-typed prefix.
+    // If there is no prefix yet, use Shift/CapsLock as the intent.
+    bool first_upper = false;
+    bool saw_alpha = false;
+    bool all_upper = true;
+    for (int i = 0; kb->current_token[i]; i++) {
+        unsigned char c = (unsigned char)kb->current_token[i];
+        if (isalpha(c)) {
+            saw_alpha = true;
+            if (i == 0 && isupper(c)) {
+                first_upper = true;
+            }
+            if (!isupper(c)) {
+                all_upper = false;
+            }
+        }
+    }
+    if (!saw_alpha) {
+        all_upper = false;
+    }
+
+    if (kb->current_token_len <= 0) {
+        if (mods & CapsLock) {
+            all_upper = true;
+            first_upper = false;
+        } else if (mods & Shift) {
+            first_upper = true;
+        }
+    }
+
+    if (all_upper) {
+        for (size_t i = 0; out[i]; i++) {
+            unsigned char c = (unsigned char)out[i];
+            if (c < 0x80) {
+                out[i] = (char)toupper(c);
+            }
+        }
+    } else if (first_upper && out[0]) {
+        out[0] = (char)toupper((unsigned char)out[0]);
+    }
+}
+
+static void
 kbd_commit_suggestion(struct kbd *kb, uint32_t time_ms, const char *word)
 {
     if (!kb || !word || !word[0]) {
@@ -1471,38 +1546,8 @@ kbd_commit_suggestion(struct kbd *kb, uint32_t time_ms, const char *word)
         return;
     }
 
-    // Preserve simple capitalization intent from the already-typed prefix.
-    bool first_upper = false;
-    bool saw_alpha = false;
-    bool all_upper = true;
-    for (int i = 0; kb->current_token[i]; i++) {
-        unsigned char c = (unsigned char)kb->current_token[i];
-        if (isalpha(c)) {
-            saw_alpha = true;
-            if (i == 0 && isupper(c)) {
-                first_upper = true;
-            }
-            if (!isupper(c)) {
-                all_upper = false;
-            }
-        }
-    }
-    if (!saw_alpha) {
-        all_upper = false;
-    }
-
     char adjusted[WVKBD_MAX_TOKEN_BYTES] = {0};
-    strncpy(adjusted, word_l, sizeof(adjusted) - 1);
-    if (all_upper) {
-        for (size_t i = 0; adjusted[i]; i++) {
-            unsigned char c = (unsigned char)adjusted[i];
-            if (c < 0x80) {
-                adjusted[i] = (char)toupper(c);
-            }
-        }
-    } else if (first_upper && adjusted[0]) {
-        adjusted[0] = (char)toupper((unsigned char)adjusted[0]);
-    }
+    kbd_adjust_suggestion_case(kb, word_in, kb->mods, adjusted);
 
     if (kb->current_token_len > 0) {
         const char *suffix = adjusted + strlen(kb->current_token);
